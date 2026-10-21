@@ -5,8 +5,10 @@ import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 
+import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -16,10 +18,12 @@ public class Repo {
     public static final String ACTOR_MANAGER = "مدير (تم التحقق بالرمز)";
 
     private static Repo instance;
+    private final Context appCtx;
     private final Db helper;
 
     private Repo(Context ctx) {
-        helper = new Db(ctx);
+        appCtx = ctx.getApplicationContext();
+        helper = new Db(appCtx);
     }
 
     public static synchronized Repo get(Context ctx) {
@@ -29,6 +33,18 @@ public class Repo {
 
     private SQLiteDatabase w() {
         return helper.getWritableDatabase();
+    }
+
+    public SQLiteDatabase database() {
+        return w();
+    }
+
+    public File dbFile() {
+        return appCtx.getDatabasePath(Db.NAME);
+    }
+
+    public void closeDb() {
+        helper.close();
     }
 
     // ---------- الإعدادات ----------
@@ -54,7 +70,61 @@ public class Repo {
         return k;
     }
 
-    // ---------- سجل التدقيق ----------
+    /** بداية اليوم التشغيلي الحالي (بالميلي ثانية). */
+    public long dayStart() {
+        String s = getSetting("day_start", null);
+        if (s == null) {
+            Calendar c = Calendar.getInstance();
+            c.set(Calendar.HOUR_OF_DAY, 0);
+            c.set(Calendar.MINUTE, 0);
+            c.set(Calendar.SECOND, 0);
+            c.set(Calendar.MILLISECOND, 0);
+            s = String.valueOf(c.getTimeInMillis());
+            putSetting("day_start", s);
+        }
+        return Long.parseLong(s);
+    }
+
+    /** {عدد الطلبات الفعالة، إجماليها} منذ بداية اليوم التشغيلي. */
+    public long[] daySummary() {
+        long start = dayStart();
+        try (Cursor c = w().rawQuery("SELECT COUNT(*),COALESCE(SUM(total),0) FROM orders " +
+                "WHERE created_at>=? AND cancelled=0", new String[]{String.valueOf(start)})) {
+            if (c.moveToFirst()) return new long[]{c.getLong(0), c.getLong(1)};
+        }
+        return new long[]{0, 0};
+    }
+
+    private boolean dayKeyUsed(SQLiteDatabase db, String key) {
+        try (Cursor c = db.rawQuery("SELECT 1 FROM orders WHERE day_key=? LIMIT 1", new String[]{key})) {
+            return c.moveToFirst();
+        }
+    }
+
+    /** يبدأ يوماً تشغيلياً جديداً. لا يحذف أي سجل. */
+    public String resetDay(String actor) {
+        SQLiteDatabase db = w();
+        db.beginTransaction();
+        try {
+            String old = currentDayKey();
+            String base = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
+            String key = base;
+            int n = 1;
+            while (key.equals(old) || dayKeyUsed(db, key)) {
+                n++;
+                key = base + "-" + n;
+            }
+            putSetting("day_key", key);
+            putSetting("day_start", String.valueOf(System.currentTimeMillis()));
+            audit("تصفير يومي", "إنهاء اليوم " + old + " وبدء اليوم " + key, actor);
+            db.setTransactionSuccessful();
+            return key;
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    // ---------- سجل التدقيق والطباعة ----------
     public void audit(String action, String details, String actor) {
         ContentValues v = new ContentValues();
         v.put("ts", System.currentTimeMillis());
@@ -62,6 +132,16 @@ public class Repo {
         v.put("details", details);
         v.put("actor", actor);
         w().insert("audit_log", null, v);
+    }
+
+    public void logPrint(String kind, String ref, String result, String error) {
+        ContentValues v = new ContentValues();
+        v.put("ts", System.currentTimeMillis());
+        v.put("kind", kind);
+        v.put("ref", ref);
+        v.put("result", result);
+        v.put("error", error == null ? "" : error);
+        w().insert("print_log", null, v);
     }
 
     // ---------- الأقسام ----------
@@ -225,7 +305,7 @@ public class Repo {
         audit(active ? "تفعيل طبق" : "تعطيل طبق", "#" + id, actor);
     }
 
-    // ---------- السائقون (للقراءة في نموذج الطلب؛ الإدارة في الجزء الثاني) ----------
+    // ---------- السائقون ----------
     public List<Models.Driver> drivers(boolean activeOnly) {
         List<Models.Driver> out = new ArrayList<>();
         String sql = "SELECT id,name,phone,active FROM drivers" +
@@ -241,6 +321,46 @@ public class Repo {
             }
         }
         return out;
+    }
+
+    public long saveDriver(long id, String name, String phone, String actor) {
+        name = name == null ? "" : name.trim();
+        if (name.isEmpty()) throw new IllegalArgumentException("اسم السائق مطلوب");
+        phone = phone == null ? "" : phone.trim();
+        if (!phone.isEmpty()) {
+            String n = Util.normalizePhone(phone);
+            if (n == null) throw new IllegalArgumentException("رقم هاتف السائق غير صالح");
+            phone = n;
+        }
+        SQLiteDatabase db = w();
+        try (Cursor c = db.rawQuery("SELECT id FROM drivers WHERE name=? AND id<>?",
+                new String[]{name, String.valueOf(id)})) {
+            if (c.moveToFirst()) throw new IllegalArgumentException("اسم السائق مستخدم مسبقاً");
+        }
+        db.beginTransaction();
+        try {
+            ContentValues v = new ContentValues();
+            v.put("name", name);
+            v.put("phone", phone);
+            if (id == 0) {
+                id = db.insertOrThrow("drivers", null, v);
+                audit("إضافة سائق", name, actor);
+            } else {
+                db.update("drivers", v, "id=?", new String[]{String.valueOf(id)});
+                audit("تعديل سائق", "#" + id + " " + name, actor);
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+        return id;
+    }
+
+    public void setDriverActive(long id, boolean active, String actor) {
+        ContentValues v = new ContentValues();
+        v.put("active", active ? 1 : 0);
+        w().update("drivers", v, "id=?", new String[]{String.valueOf(id)});
+        audit(active ? "تفعيل سائق" : "تعطيل سائق", "#" + id, actor);
     }
 
     // ---------- الطلبات ----------
@@ -340,6 +460,15 @@ public class Repo {
             args = new String[]{q, "%" + q + "%", q};
         }
         try (Cursor c = w().rawQuery(sql, args)) {
+            while (c.moveToNext()) out.add(readOrder(c));
+        }
+        return out;
+    }
+
+    public List<Models.OrderRow> ordersBetween(long from, long to) {
+        List<Models.OrderRow> out = new ArrayList<>();
+        try (Cursor c = w().rawQuery("SELECT " + ORDER_COLS + " FROM orders WHERE created_at>=? AND created_at<? " +
+                "ORDER BY id", new String[]{String.valueOf(from), String.valueOf(to)})) {
             while (c.moveToNext()) out.add(readOrder(c));
         }
         return out;
